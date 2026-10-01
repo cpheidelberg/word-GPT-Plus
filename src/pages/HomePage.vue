@@ -50,6 +50,17 @@
         </div>
       </div>
 
+      <!-- ICCR Action -->
+      <button
+        class="flex w-full shrink-0 cursor-pointer items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-fast ease-apple hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+        :disabled="loading"
+        :title="t('checkIccr')"
+        @click="checkIccr"
+      >
+        <ClipboardCheck :size="17" />
+        <span>{{ t('checkIccr') }}</span>
+      </button>
+
       <!-- Quick Actions Bar -->
       <div class="flex w-full items-center justify-center gap-2 overflow-hidden rounded-md">
         <CustomButton
@@ -247,6 +258,7 @@ import {
   BookOpen,
   BotMessageSquare,
   CheckCircle,
+  ClipboardCheck,
   Copy,
   FileCheck,
   FileText,
@@ -409,6 +421,7 @@ const useSelectedText = useStorage(localStorageKey.useSelectedText, true)
 const insertType = ref<insertTypes>('replace')
 
 const errorIssue = ref<boolean | string | null>(false)
+const iccrEndpoint = import.meta.env.VITE_ICCR_CHECK_ENDPOINT || 'http://localhost:8000/api/iccr/check'
 
 const displayHistory = computed(() => {
   return history.value.filter(msg => !(msg instanceof SystemMessage))
@@ -644,6 +657,126 @@ async function applyQuickAction(actionKey: keyof typeof buildInPrompt) {
       // Remove failed message
       history.value.pop()
     }
+  } finally {
+    loading.value = false
+    abortController.value = null
+  }
+}
+
+async function getSelectedOrDocumentText() {
+  return Word.run(async ctx => {
+    const selection = ctx.document.getSelection()
+    selection.load('text')
+    await ctx.sync()
+
+    if (selection.text?.trim()) {
+      return {
+        text: selection.text,
+        source: 'selection',
+      }
+    }
+
+    const body = ctx.document.body
+    body.load('text')
+    await ctx.sync()
+
+    return {
+      text: body.text || '',
+      source: 'document',
+    }
+  })
+}
+
+function formatIccrResult(result: any, source: string) {
+  const lines: string[] = [
+    `ICCR check complete (${source === 'selection' ? 'selected text' : 'full document'}).`,
+  ]
+
+  if (!result?.matched) {
+    lines.push('', 'No matching ICCR dataset was found.')
+    if (result?.reason) lines.push('', `Reason: ${result.reason}`)
+    return lines.join('\n')
+  }
+
+  if (result.iccr_dataset_url) {
+    lines.push('', `Dataset: ${result.iccr_dataset_url}`)
+  }
+  if (result.reason) {
+    lines.push(`Match reason: ${result.reason}`)
+  }
+
+  const counts = result.summary_counts || {}
+  const countEntries = Object.entries(counts)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}: ${value}`)
+
+  if (countEntries.length > 0) {
+    lines.push('', `Summary: ${countEntries.join(', ')}`)
+  }
+
+  const checklist = Array.isArray(result.checklist) ? result.checklist : []
+  if (checklist.length > 0) {
+    lines.push('', 'Checklist:')
+    for (const item of checklist) {
+      const element = item.element || item.requirement || 'Unnamed element'
+      const status = item.status || 'unknown'
+      const core = item.core === undefined ? '' : `, core: ${item.core ? 'yes' : 'no'}`
+      const value = item.value_found ? `, value: ${item.value_found}` : ''
+      const evidence = item.evidence ? `\n  Evidence: ${item.evidence}` : ''
+      const comment = item.comment ? `\n  Comment: ${item.comment}` : ''
+      lines.push(`- ${element}: ${status}${core}${value}${evidence}${comment}`)
+    }
+  }
+
+  return lines.join('\n')
+}
+
+async function checkIccr() {
+  if (loading.value) return
+
+  const { text, source } = await getSelectedOrDocumentText()
+  if (!text.trim()) {
+    messageUtil.error(t('emptyDocumentPrompt'))
+    return
+  }
+
+  const userMessage = new HumanMessage(
+    source === 'selection' ? t('checkIccrSelectionRequest') : t('checkIccrDocumentRequest'),
+  )
+
+  history.value.push(userMessage, new AIMessage(t('checkingIccr')))
+  await scrollToBottom()
+
+  loading.value = true
+  abortController.value = new AbortController()
+
+  try {
+    const response = await fetch(iccrEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ report_text: text }),
+      signal: abortController.value.signal,
+    })
+
+    if (!response.ok) {
+      throw new Error(`ICCR check failed with HTTP ${response.status}`)
+    }
+
+    const result = await response.json()
+    history.value[history.value.length - 1] = new AIMessage(formatIccrResult(result, source))
+    await scrollToBottom()
+  } catch (error: any) {
+    if (error.name === 'AbortError') {
+      messageUtil.info(t('generationStop'))
+      history.value.pop()
+      return
+    }
+
+    console.error(error)
+    messageUtil.error(t('failedToCheckIccr'))
+    history.value[history.value.length - 1] = new AIMessage(t('failedToCheckIccr'))
   } finally {
     loading.value = false
     abortController.value = null
